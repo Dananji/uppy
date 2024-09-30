@@ -5,6 +5,7 @@ const logger = require('../../logger')
 const adaptData = require('./adapter')
 const { withProviderErrorHandling } = require('../providerErrors')
 const { prepareStream } = require('../../helpers/utils')
+const querystring = require('node:querystring')
 
 const getClient = ({ token }) => got.extend({
   prefixUrl: 'https://graph.microsoft.com/v1.0',
@@ -39,8 +40,23 @@ class OneDrive extends Provider {
    */
   async list ({ directory, query, token }) {
     return this.#withErrorHandling('provider.onedrive.list.error', async () => {
-      const path = directory ? `items/${directory}` : 'root'
-      const qs = { $expand: 'thumbnails' }
+      let path
+      const qs = {}
+      if (!query.driveId) {
+        path = 'me/drives'
+      } else if (query.driveId === '_listsites_') {
+        path = 'sites?search='
+      } else {
+        path = `drives/${query.driveId}/`
+        if (!!directory && directory !== 'root') {
+          path += `items/${directory}`
+        } else {
+          path += 'root'
+        }
+        path += '/children'
+        qs.$expand = 'thumbnails'
+      }
+
       if (query.cursor) {
         qs.$skiptoken = query.cursor
       }
@@ -49,10 +65,46 @@ class OneDrive extends Provider {
 
       const [{ mail, userPrincipalName }, list] = await Promise.all([
         client.get('me', { responseType: 'json' }).json(),
-        client.get(`${getRootPath(query)}/${path}/children`, { searchParams: qs, responseType: 'json' }).json(),
+        client.get(path, { searchParams: JSON.stringify(qs), responseType: 'json' }).json(),
       ])
 
-      return adaptData(list, mail || userPrincipalName)
+      if (query.driveId === '_listsites_') {
+        return this.adaptSharepointSitesData(list, mail || userPrincipalName, token)
+      }
+      return adaptData(list, mail || userPrincipalName, !query.driveId)
+    })
+  }
+
+  getNextPagePath = (data) => {
+    if (!data['@odata.nextLink']) {
+      return null
+    }
+
+    const query = { cursor: querystring.parse(data['@odata.nextLink']).$skiptoken }
+    return `?${querystring.stringify(query)}`
+  }
+
+  async adaptSharepointSitesData (res, username, token) {
+    return this.#withErrorHandling('provider.onedrive.list.error', async () => {
+      const items = res.value
+      let loadedSites = 0
+      const data = { username, items: [] }
+      items.forEach(async (item) => {
+        const siteName = item.displayName
+        const client = getClient({ token })
+        const response = await client.get(`sites/${item.id}/drives`, { responseType: 'json' }).json()
+        const siteDrives = adaptData(response).items
+        siteDrives.forEach((item) => {
+          item.name = `${siteName} ${item.name}`
+        })
+        loadedSites++
+        data.items.push(siteDrives)
+
+        if (loadedSites === items.length) {
+          data.nextPagePath = this.getNextPagePath(res)
+          return data
+        }
+      })
     })
   }
 
